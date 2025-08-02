@@ -1,0 +1,4 @@
+requests
+playwright
+
+# run playwright install
