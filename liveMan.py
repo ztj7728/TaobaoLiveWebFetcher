@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-淘宝直播间弹幕监听器
+淘宝直播间弹幕监听器 - 优化版
 根据给定淘宝直播间 URL 或 ID，自动化抓取 topic 和所需 Cookie，并监听输出弹幕。
 使用 mtop.taobao.powermsg.h5.msg.pullnativemsg 接口进行心跳维护，支持长时间监听。
+数据输出格式与抖音监听器保持一致，支持无痛接入。
+
 依赖：requests, playwright
 安装：
     pip install requests playwright
     playwright install
+
 示例用法：
     # 使用 URL
     python liveMan.py https://tbzb.taobao.com/live?liveId=518876609326
@@ -28,6 +31,7 @@ import threading
 import random
 import requests
 import queue
+import logging
 from urllib.parse import urlparse, parse_qs, unquote
 from playwright.sync_api import sync_playwright
 
@@ -60,15 +64,113 @@ class TaobaoLiveWebFetcher:
         self.cookie_dict = None
         self.session = None
 
-        # 断线重连与心跳维护
+        # 断线重连与心跳维护 - 与抖音版本保持一致
         self._stop_event = threading.Event()
         self._connection_thread = None
         self._heartbeat_thread = None
         self._reconnect_delay = 1
         self._max_reconnect_delay = 60
         self._pagination_ctx = None
+        self._last_message_time = time.time()
+        self._heartbeat_interval = 10  # 心跳间隔
+        self._no_message_timeout = 30  # 无消息超时时间
 
-    # （以下方法保持不变）
+        # 配置日志
+        self.logger = logging.getLogger(__name__)
+
+    def start(self):
+        """启动 WebSocket 连接和监控 - 与抖音版本保持一致的接口"""
+        self._stop_event.clear()
+        self._reconnect_delay = 1
+        print("【i】开始监听淘宝直播弹幕...")
+        self._connection_thread = threading.Thread(target=self._run_connection_loop)
+        self._connection_thread.daemon = True
+        self._connection_thread.start()
+        return self
+
+    def stop(self):
+        """停止监听 - 与抖音版本保持一致的接口"""
+        print("【i】正在停止监听...")
+        self._stop_event.set()
+        if self._connection_thread and self._connection_thread.is_alive():
+            self._connection_thread.join(timeout=5)
+        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
+            self._heartbeat_thread.join(timeout=5)
+        if self.session:
+            self.session.close()
+        print("【X】监听已停止。")
+
+    def get_room_status(self):
+        """获取直播间状态 - 与抖音版本保持一致的接口"""
+        if not self.live_id:
+            print("【X】无法获取直播间ID，无法查询状态")
+            return
+        print(f"【i】直播间ID: {self.live_id}")
+        # 可以在这里实现具体的状态查询逻辑
+        print("【i】直播间状态查询功能待实现")
+
+    def _run_connection_loop(self):
+        """内部连接循环管理"""
+        while not self._stop_event.is_set():
+            try:
+                self._connect_and_listen()
+                if not self._stop_event.is_set():
+                    print("【i】连接正常结束，尝试重连...")
+                    self._handle_reconnect("连接正常结束")
+                else:
+                    break
+            except Exception as e:
+                print(f"【X】连接或运行时发生错误: {e}")
+                if not self._stop_event.is_set():
+                    self._handle_reconnect(f"未知错误: {e}")
+                else:
+                    break
+
+        print("【i】连接循环已停止。")
+
+    def _handle_reconnect(self, reason):
+        """处理重连等待期"""
+        if self._stop_event.is_set():
+            print("【i】停止事件已设置，取消重连。")
+            return
+
+        print(f"【i】连接因 '{reason}' 中断。将在 {self._reconnect_delay} 秒后尝试重连...")
+        self._stop_event.wait(timeout=self._reconnect_delay)
+        if self._stop_event.is_set():
+            print("【i】等待重连时收到停止信号，取消重连。")
+            return
+
+        # 指数退避
+        self._reconnect_delay = min(self._reconnect_delay * 2, self._max_reconnect_delay)
+        print("【i】正在尝试重连...")
+
+    def _connect_and_listen(self):
+        """连接和监听的主要逻辑"""
+        try:
+            print("【i】正在获取直播间参数...")
+            self.topic, self.cookie_dict = self.get_topic_and_cookies()
+            print(f"【√】成功获取直播间参数: topic={self.topic}")
+            
+            self.session = requests.Session()
+            self.session.headers.update({'User-Agent': self.user_agent})
+            self.session.cookies.update(self.cookie_dict)
+            
+            # 启动心跳线程
+            self._heartbeat_thread = threading.Thread(target=self._heartbeat_powermsg, daemon=True)
+            self._heartbeat_thread.start()
+            print("【√】心跳线程已启动")
+            
+            # 重置最后消息时间
+            self._last_message_time = time.time()
+            self._reconnect_delay = 1  # 重置重连延迟
+            
+            # 开始监听评论
+            self._listen_comments()
+            
+        except Exception as e:
+            print(f"【X】连接过程出错: {e}")
+            raise
+
     def get_topic_and_cookies(self):
         """使用 Playwright 渲染并拦截请求，提取 topic 并获取必要 Cookie。"""
         topic = None
@@ -132,6 +234,7 @@ class TaobaoLiveWebFetcher:
         return json.loads(json_str)
 
     def _heartbeat_powermsg(self):
+        """心跳线程 - 增加连接状态检查"""
         url = "https://h5api.m.taobao.com/h5/mtop.taobao.powermsg.h5.msg.pullnativemsg/1.0/"
         app_key = "12574478"
         offset = str(int(time.time() * 1000))
@@ -144,6 +247,12 @@ class TaobaoLiveWebFetcher:
         print("【i】心跳线程已启动。")
         while not self._stop_event.is_set():
             try:
+                # 检查连接是否失效（类似抖音版本的逻辑）
+                now = time.time()
+                if now - self._last_message_time > self._no_message_timeout:
+                    print(f"【!】超过 {self._no_message_timeout} 秒未收到消息，连接可能已失效")
+                    break  # 退出心跳线程，让主循环处理重连
+
                 t = str(int(time.time() * 1000))
                 data = {
                     "topic": self.topic,
@@ -177,10 +286,13 @@ class TaobaoLiveWebFetcher:
 
                 if success and timestamps:
                     print(f"【心跳】收到 {len(timestamps)} 条消息通知，offset: {old_offset} -> {offset}")
+                    # 更新最后消息时间
+                    self._last_message_time = time.time()
                 else:
                     print(f"【心跳】状态: {'成功' if success else '失败'} - {ret0}")
 
-                time_to_wait = 10
+                # 使用与抖音版本相同的等待逻辑
+                time_to_wait = self._heartbeat_interval
                 while time_to_wait > 0 and not self._stop_event.is_set():
                     sleep_duration = min(time_to_wait, 1.0)
                     woken_up = self._stop_event.wait(timeout=sleep_duration)
@@ -197,89 +309,172 @@ class TaobaoLiveWebFetcher:
         print("【i】心跳线程已停止。")
 
     def _listen_comments(self):
-        self._reconnect_delay = 1
+        """监听评论 - 优化数据输出格式"""
         while not self._stop_event.is_set():
             try:
                 res = self.fetch_comments()
                 data = res.get('data', {})
                 self._pagination_ctx = data.get('paginationContext')
                 comments = data.get('comments', [])
+                
                 if comments:
                     print(f"【i】收到 {len(comments)} 条新消息")
+                    # 更新最后消息时间
+                    self._last_message_time = time.time()
+                
                 for c in comments:
-                    nick = c.get('publisherNick', '匿名')
-                    content = c.get('content', '')
-                    user_id = c.get('publisherId', '')
-                    display_text = f"{nick}: {content}"
-                    output_data = {
-                        "type": "chat",
-                        "data": {"user_id": user_id, "user_name": nick, "content": content},
-                        "display_text": display_text
-                    }
-                    if self.message_queue:
-                        self.message_queue.put(output_data)
-                    else:
-                        print(f"【聊天msg】{display_text}")
+                    self._parse_comment_message(c)
+                
                 delay = int(data.get('delay', 6000)) / 1000
                 for _ in range(int(delay)):
-                    if self._stop_event.is_set(): break
+                    if self._stop_event.is_set(): 
+                        break
                     time.sleep(1)
-                self._reconnect_delay = 1
+                    
             except Exception as e:
                 print(f"【X】获取弹幕失败: {e}")
                 if not self._stop_event.is_set():
                     print(f"【i】将在 {self._reconnect_delay} 秒后尝试重连...")
-                    self._stop_event.wait(timeout=self._reconnect_delay)
-                    self._reconnect_delay = min(self._reconnect_delay * 2, self._max_reconnect_delay)
+                    raise  # 让上层处理重连逻辑
+                    
         print("【i】评论监听线程已停止。")
 
-    def _run_connection_loop(self):
+    def _parse_comment_message(self, comment):
+        """解析评论消息 - 统一输出格式与抖音版本保持一致"""
         try:
-            print("【i】正在获取直播间参数...")
-            self.topic, self.cookie_dict = self.get_topic_and_cookies()
-            print(f"【√】成功获取直播间参数: topic={self.topic}")
-            self.session = requests.Session()
-            self.session.headers.update({'User-Agent': self.user_agent})
-            self.session.cookies.update(self.cookie_dict)
-            self._heartbeat_thread = threading.Thread(target=self._heartbeat_powermsg, daemon=True)
-            self._heartbeat_thread.start()
-            print("【√】心跳线程已启动")
-            self._listen_comments()
+            nick = comment.get('publisherNick', '匿名')
+            content = comment.get('content', '')
+            user_id = comment.get('publisherId', '')
+            
+            # 检查是否为礼物消息（淘宝直播中礼物信息可能包含在评论中）
+            if self._is_gift_message(content):
+                self._parse_gift_from_comment(comment, nick, user_id, content)
+            else:
+                # 普通聊天消息 - 与抖音格式完全一致
+                display_text = f"{nick}: {content}"
+                output_data = {
+                    "type": "chat",
+                    "data": {
+                        "user_id": user_id,
+                        "user_name": nick,
+                        "content": content
+                    },
+                    "display_text": display_text
+                }
+                
+                if self.message_queue:
+                    self.message_queue.put(output_data)
+                else:
+                    print(f"【聊天msg】{display_text}")
+                    
         except Exception as e:
-            print(f"【X】连接循环出错: {e}")
-            if not self._stop_event.is_set():
-                print(f"【i】将在 {self._reconnect_delay} 秒后尝试重连...")
-                self._stop_event.wait(timeout=self._reconnect_delay)
-                self._reconnect_delay = min(self._reconnect_delay * 2, self._max_reconnect_delay)
-                if not self._stop_event.is_set():
-                    self._run_connection_loop()
+            print(f"【X】解析评论消息时出错: {e}")
 
-    def start(self):
-        self._stop_event.clear()
-        self._reconnect_delay = 1
-        print("【i】开始监听淘宝直播弹幕...")
-        self._connection_thread = threading.Thread(target=self._run_connection_loop)
-        self._connection_thread.daemon = True
-        self._connection_thread.start()
-        return self
+    def _is_gift_message(self, content):
+        """判断是否为礼物消息"""
+        gift_keywords = ['送出了', '打赏了', '礼物', '小心心', '棒棒糖', '点赞']
+        return any(keyword in content for keyword in gift_keywords)
 
-    def stop(self):
-        print("【i】正在停止监听...")
-        self._stop_event.set()
-        if self._connection_thread and self._connection_thread.is_alive():
-            self._connection_thread.join(timeout=5)
-        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
-            self._heartbeat_thread.join(timeout=5)
-        if self.session:
-            self.session.close()
-        print("【X】监听已停止。")
+    def _parse_gift_from_comment(self, comment, user_name, user_id, content):
+        """从评论中解析礼物信息 - 输出格式与抖音保持一致"""
+        # 尝试从内容中提取礼物信息
+        gift_name = "未知礼物"
+        gift_count = 1
+        
+        # 简单的礼物解析逻辑（可根据实际情况优化）
+        if "送出了" in content:
+            parts = content.split("送出了")
+            if len(parts) > 1:
+                gift_info = parts[1].strip()
+                # 尝试提取数量
+                import re
+                count_match = re.search(r'(\d+)', gift_info)
+                if count_match:
+                    gift_count = int(count_match.group(1))
+                gift_name = re.sub(r'\d+', '', gift_info).strip()
+        
+        display_text = f"{user_name} 送出了 {gift_name}x{gift_count}"
+        output_data = {
+            "type": "gift",
+            "data": {
+                "user_name": user_name,
+                "gift_name": gift_name,
+                "count": gift_count
+            },
+            "display_text": display_text
+        }
+        
+        if self.message_queue:
+            self.message_queue.put(output_data)
+        else:
+            print(f"【礼物msg】{display_text}")
 
-    def get_room_status(self):
-        if not self.live_id:
-            print("【X】无法获取直播间ID，无法查询状态")
-            return
-        print(f"【i】直播间ID: {self.live_id}")
-        print("【i】直播间状态查询功能待实现")
+    def _parse_system_message(self, message_type, data):
+        """解析系统消息 - 保持与抖音格式一致"""
+        if message_type == "member_enter":
+            # 用户进入直播间
+            user_name = data.get('user_name', '未知用户')
+            user_id = data.get('user_id', '')
+            display_text = f"{user_name} 进入了直播间"
+            output_data = {
+                "type": "member",
+                "data": {
+                    "user_id": user_id,
+                    "user_name": user_name,
+                    "gender": "未知"  # 淘宝可能没有性别信息
+                },
+                "display_text": display_text
+            }
+            
+        elif message_type == "like":
+            # 点赞消息
+            user_name = data.get('user_name', '未知用户')
+            count = data.get('count', 1)
+            display_text = f"{user_name} 点了{count}个赞"
+            output_data = {
+                "type": "like",
+                "data": {
+                    "user_name": user_name,
+                    "count": count
+                },
+                "display_text": display_text
+            }
+            
+        elif message_type == "follow":
+            # 关注消息
+            user_name = data.get('user_name', '未知用户')
+            user_id = data.get('user_id', '')
+            display_text = f"{user_name} 关注了主播"
+            output_data = {
+                "type": "social",
+                "data": {
+                    "user_id": user_id,
+                    "user_name": user_name
+                },
+                "display_text": display_text
+            }
+            
+        elif message_type == "room_stats":
+            # 直播间统计
+            current = data.get('current_viewers', 0)
+            total = data.get('total_viewers', 0)
+            display_text = f"当前观看人数: {current}, 累计观看人数: {total}"
+            output_data = {
+                "type": "stat",
+                "data": {
+                    "current_viewers": current,
+                    "total_viewers": total
+                },
+                "display_text": display_text
+            }
+            
+        else:
+            return  # 未知消息类型，忽略
+            
+        if self.message_queue:
+            self.message_queue.put(output_data)
+        else:
+            print(f"【系统msg】{display_text}")
 
 
 def main():
